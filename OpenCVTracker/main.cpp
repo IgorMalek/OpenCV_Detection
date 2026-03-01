@@ -1,8 +1,28 @@
-﻿#include <opencv2/opencv.hpp>
+﻿#define NOMINMAX
+#include <opencv2/opencv.hpp>
 #include <opencv2/objdetect.hpp>
 #include <iostream>
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <atomic>
+
+// Windows socket headers
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "Ws2_32.lib")
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const int    HOT_THRESHOLD = 220;
+const double MIN_AREA = 500.0;
+const double HAND_MIN_AREA = 6000.0;
+const int    HTTP_PORT = 8082;
 
 enum VisionMode {
   MODE_ORIGINAL,
@@ -10,9 +30,118 @@ enum VisionMode {
   MODE_NIGHTVISION
 };
 
-const int HOT_THRESHOLD = 220;
-const double MIN_AREA = 500.0;
-const double HAND_MIN_AREA = 6000.0;
+// ---------------------------------------------------------------------------
+// Shared frame buffer between main loop and HTTP server thread
+// ---------------------------------------------------------------------------
+
+struct SharedFrame {
+  std::mutex          mtx;
+  std::vector<uchar>  jpegBuf;   // latest JPEG-encoded frame
+  bool                ready = false;
+};
+
+static SharedFrame g_frame;
+static std::atomic<bool> g_running{ true };
+
+// ---------------------------------------------------------------------------
+// HTTP MJPEG server (runs in a separate thread)
+// Serves a single persistent connection as multipart/x-mixed-replace.
+// Open http://127.0.0.1:8080 in Chrome or Firefox.
+// http://82.64.237.163:8082
+// ---------------------------------------------------------------------------
+
+void httpServerThread()
+{
+  WSADATA wsa{};
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+
+  SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (listenSock == INVALID_SOCKET) {
+    std::cerr << "[HTTP] socket() failed." << std::endl;
+    return;
+  }
+
+  int opt = 1;
+  setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR,
+    reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(HTTP_PORT);
+  addr.sin_addr.s_addr = INADDR_ANY;
+
+  if (bind(listenSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+    std::cerr << "[HTTP] bind() failed on port " << HTTP_PORT << std::endl;
+    closesocket(listenSock);
+    return;
+  }
+
+  listen(listenSock, 5);
+  std::cout << "[HTTP] MJPEG stream ready at http://82.64.237.163:" << HTTP_PORT << std::endl;
+
+  while (g_running) {
+    // Accept one client at a time (blocking with timeout via select)
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(listenSock, &fds);
+    timeval tv{ 1, 0 };   // 1-second timeout so we can check g_running
+    if (select(0, &fds, nullptr, nullptr, &tv) <= 0) continue;
+
+    SOCKET client = accept(listenSock, nullptr, nullptr);
+    if (client == INVALID_SOCKET) continue;
+
+    // Drain the HTTP request (we don't need to parse it)
+    char reqBuf[2048] = {};
+    recv(client, reqBuf, sizeof(reqBuf) - 1, 0);
+
+    // Send HTTP response header for MJPEG stream
+    const char* httpHeader =
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+      "Cache-Control: no-cache\r\n"
+      "Connection: close\r\n"
+      "\r\n";
+    send(client, httpHeader, (int)strlen(httpHeader), 0);
+
+    // Stream frames until client disconnects or app exits
+    while (g_running) {
+      std::vector<uchar> jpg;
+      {
+        std::lock_guard<std::mutex> lock(g_frame.mtx);
+        if (!g_frame.ready) continue;
+        jpg = g_frame.jpegBuf;
+      }
+
+      // Build MIME part header
+      char partHeader[256];
+      int partLen = snprintf(partHeader, sizeof(partHeader),
+        "--frame\r\n"
+        "Content-Type: image/jpeg\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n",
+        (int)jpg.size());
+
+      int r1 = send(client, partHeader, partLen, 0);
+      int r2 = send(client, reinterpret_cast<const char*>(jpg.data()),
+        (int)jpg.size(), 0);
+      int r3 = send(client, "\r\n", 2, 0);
+
+      if (r1 == SOCKET_ERROR || r2 == SOCKET_ERROR || r3 == SOCKET_ERROR)
+        break;   // client disconnected
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(33)); // ~30 fps
+    }
+
+    closesocket(client);
+  }
+
+  closesocket(listenSock);
+  WSACleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Gesture classification (unchanged)
+// ---------------------------------------------------------------------------
 
 std::string classifyGesture(const std::vector<cv::Point>& contour,
   const std::vector<cv::Vec4i>& defects,
@@ -21,25 +150,27 @@ std::string classifyGesture(const std::vector<cv::Point>& contour,
   if (defects.empty()) return "FIST";
 
   int fingerCount = 0;
-  double contourArea = cv::contourArea(contour);
 
   for (const auto& defect : defects) {
     cv::Point start = contour[defect[0]];
     cv::Point end = contour[defect[1]];
-    cv::Point far = contour[defect[2]];
-    float depth = defect[3] / 256.0f;
+    cv::Point farPt = contour[defect[2]];
+    float     depth = defect[3] / 256.0f;
 
     if (depth < 20.0f) continue;
 
     double a = cv::norm(end - start);
-    double b = cv::norm(far - start);
-    double c = cv::norm(end - far);
-    double angle = std::acos((b * b + c * c - a * a) / (2 * b * c)) * 180.0 / CV_PI;
+    double b = cv::norm(farPt - start);
+    double c = cv::norm(end - farPt);
+    double denom = 2.0 * b * c;
+    if (denom < 1e-6) continue;
+
+    double angle = std::acos(
+      std::clamp((b * b + c * c - a * a) / denom, -1.0, 1.0)
+    ) * 180.0 / CV_PI;
 
     if (angle < 90.0) fingerCount++;
   }
-
-  float aspectRatio = (float)bbox.width / (float)bbox.height;
 
   if (fingerCount == 0) return "FIST";
   if (fingerCount == 1) return "PEACE / POINT";
@@ -50,7 +181,13 @@ std::string classifyGesture(const std::vector<cv::Point>& contour,
   return "UNKNOWN";
 }
 
-void processModeNormal(const cv::Mat& frame, cv::Mat& output, cv::CascadeClassifier& faceCascade)
+// ---------------------------------------------------------------------------
+// Normal mode: skin-based hand detection + gesture classification (unchanged)
+// ---------------------------------------------------------------------------
+
+void processModeNormal(const cv::Mat& frame,
+  cv::Mat& output,
+  cv::CascadeClassifier& faceCascade)
 {
   cv::Mat hsv, skinMask, blurred, gray;
 
@@ -59,8 +196,8 @@ void processModeNormal(const cv::Mat& frame, cv::Mat& output, cv::CascadeClassif
   cv::cvtColor(blurred, gray, cv::COLOR_BGR2GRAY);
 
   cv::inRange(hsv,
-    cv::Scalar(0, 20, 75),
-    cv::Scalar(20, 255, 255),
+    cv::Scalar(0, 10, 60),
+    cv::Scalar(10, 255, 255),
     skinMask);
 
   cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
@@ -72,12 +209,11 @@ void processModeNormal(const cv::Mat& frame, cv::Mat& output, cv::CascadeClassif
   faceCascade.detectMultiScale(gray, faces, 1.1, 4, 0, cv::Size(60, 60));
   for (const auto& face : faces) {
     int pad = (int)(face.width * 0.15);
-    cv::Rect expanded(
-      std::max(0, face.x - pad),
-      std::max(0, face.y - pad),
-      std::min(skinMask.cols - face.x + pad, face.width + 2 * pad),
-      std::min(skinMask.rows - face.y + pad, face.height + 2 * pad)
-    );
+    int ex = std::max(0, face.x - pad);
+    int ey = std::max(0, face.y - pad);
+    int ew = std::min(skinMask.cols - ex, face.width + 2 * pad);
+    int eh = std::min(skinMask.rows - ey, face.height + 2 * pad);
+    cv::Rect expanded(ex, ey, ew, eh);
     skinMask(expanded) = 0;
   }
 
@@ -88,18 +224,16 @@ void processModeNormal(const cv::Mat& frame, cv::Mat& output, cv::CascadeClassif
     cv::rectangle(output, face, cv::Scalar(255, 100, 0), 2);
     cv::putText(output, "FACE",
       cv::Point(face.x, face.y - 8),
-      cv::FONT_HERSHEY_SIMPLEX, 0.55,
-      cv::Scalar(255, 100, 0), 1);
+      cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 100, 0), 1);
   }
 
   int handCount = 0;
-
   for (const auto& contour : contours) {
     double area = cv::contourArea(contour);
     if (area < HAND_MIN_AREA) continue;
 
     cv::Rect bboxCheck = cv::boundingRect(contour);
-    float aspectRatio = (float)bboxCheck.width / (float)bboxCheck.height;
+    float    aspectRatio = (float)bboxCheck.width / (float)bboxCheck.height;
     if (aspectRatio > 1.4f) continue;
 
     handCount++;
@@ -126,51 +260,67 @@ void processModeNormal(const cv::Mat& frame, cv::Mat& output, cv::CascadeClassif
 
     cv::putText(output, gesture,
       cv::Point(bbox.x, bbox.y - 12),
-      cv::FONT_HERSHEY_SIMPLEX, 0.65,
-      cv::Scalar(0, 255, 0), 2);
+      cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 255, 0), 2);
 
     std::string areaStr = "AREA: " + std::to_string((int)area) + "px";
     cv::putText(output, areaStr,
       cv::Point(bbox.x, bbox.y + bbox.height + 18),
-      cv::FONT_HERSHEY_SIMPLEX, 0.45,
-      cv::Scalar(200, 200, 200), 1);
+      cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(200, 200, 200), 1);
   }
 
   std::string handStr = "HANDS DETECTED: " + std::to_string(handCount);
   cv::putText(output, handStr,
     cv::Point(10, 55),
-    cv::FONT_HERSHEY_SIMPLEX, 0.6,
-    cv::Scalar(0, 255, 255), 2);
+    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
 
   cv::putText(output, "MODE: NORMAL | GESTURE DETECTION",
     cv::Point(10, 30),
-    cv::FONT_HERSHEY_SIMPLEX, 0.65,
-    cv::Scalar(0, 255, 0), 2);
+    cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 255, 0), 2);
 }
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+static const std::string STREAM_1 = "http://82.64.237.163:8082/mjpg/video.mjpg";
+static const std::string STREAM_2 = "http://82.64.237.163:8083/mjpg/video.mjpg";
 
 int main()
 {
-  cv::VideoCapture cap(0);
+  int activeStream = 1;
+
+  // --- Input: MJPEG network stream via FFMPEG --------------------------------
+  cv::VideoCapture cap(STREAM_1, cv::CAP_FFMPEG);
   if (!cap.isOpened()) {
-    std::cerr << "Camera Error!" << std::endl;
+    std::cerr << "[ERROR] Cannot open stream: " << STREAM_1 << std::endl;
     return -1;
   }
+  std::cout << "[INFO] Input stream 1 opened: " << STREAM_1 << std::endl;
 
+  // --- Face cascade ----------------------------------------------------------
   cv::CascadeClassifier faceCascade;
   if (!faceCascade.load("haarcascade_frontalface_default.xml")) {
-    std::cerr << "Error: File not found haarcascade_frontalface_default.xml!" << std::endl;
+    std::cerr << "[ERROR] File not found: haarcascade_frontalface_default.xml" << std::endl;
     return -1;
   }
 
-  cv::Mat frame, output;
+  // --- Start HTTP MJPEG server in background thread -------------------------
+  std::thread serverThread(httpServerThread);
+
+  // --- State -----------------------------------------------------------------
+  cv::Mat    frame, output;
   VisionMode currentMode = MODE_ORIGINAL;
 
-  std::cout << "Optic system ready." << std::endl;
-  std::cout << " [O] Normal + Gesture | [T] Thermal | [N] Nightvision + Targeting | [ESC] Exit" << std::endl;
+  std::cout << "[INFO] Optic system ready." << std::endl;
+  std::cout << "       [O] Normal+Gesture  [T] Thermal  [N] NVG+Targeting  [1] Stream 1  [2] Stream 2  [ESC] Exit" << std::endl;
 
+  // --- Main loop -------------------------------------------------------------
   while (true) {
     cap >> frame;
-    if (frame.empty()) break;
+    if (frame.empty()) {
+      std::cerr << "[WARN] Empty frame — stream ended or connection lost." << std::endl;
+      break;
+    }
 
     frame.copyTo(output);
 
@@ -201,20 +351,17 @@ int main()
         std::string label = "HOTSPOT [" + std::to_string((int)area) + "px]";
         cv::putText(thermal, label,
           cv::Point(bbox.x, bbox.y - 10),
-          cv::FONT_HERSHEY_SIMPLEX, 0.45,
-          cv::Scalar(0, 255, 0), 1);
+          cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 0), 1);
       }
 
       std::string countStr = "TARGETS: " + std::to_string(targetCount);
       cv::putText(thermal, countStr,
         cv::Point(10, 55),
-        cv::FONT_HERSHEY_SIMPLEX, 0.6,
-        cv::Scalar(0, 255, 255), 2);
+        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
 
       cv::putText(thermal, "MODE: THERMAL",
         cv::Point(10, 30),
-        cv::FONT_HERSHEY_SIMPLEX, 0.7,
-        cv::Scalar(255, 255, 255), 2);
+        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
 
       output = thermal;
     }
@@ -242,29 +389,77 @@ int main()
         cv::drawMarker(output, center, cv::Scalar(0, 0, 255), cv::MARKER_CROSS, 10, 1);
         cv::putText(output, "TGT ACQUIRED",
           cv::Point(face.x, face.y - 10),
-          cv::FONT_HERSHEY_SIMPLEX, 0.5,
-          cv::Scalar(0, 0, 255), 1);
+          cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
       }
 
       cv::putText(output, "MODE: NVG + TARGETING",
         cv::Point(10, 30),
-        cv::FONT_HERSHEY_SIMPLEX, 0.7,
-        cv::Scalar(0, 255, 0), 2);
+        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
     }
     // ===================== MODE: NORMAL =====================
     else {
       processModeNormal(frame, output, faceCascade);
     }
 
+    // --- Local preview window ----------------------------------------------
+    std::string streamLabel = "SRC: STREAM " + std::to_string(activeStream);
+    cv::putText(output, streamLabel,
+      cv::Point(output.cols - 160, 30),
+      cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(100, 200, 255), 1);
+
     cv::imshow("Integrated Optic System", output);
 
+    // --- Encode frame to JPEG and push to shared buffer for HTTP server ---
+    std::vector<uchar> jpegBuf;
+    cv::imencode(".jpg", output, jpegBuf,
+      { cv::IMWRITE_JPEG_QUALITY, 85 });
+    {
+      std::lock_guard<std::mutex> lock(g_frame.mtx);
+      g_frame.jpegBuf = std::move(jpegBuf);
+      g_frame.ready = true;
+    }
+
+    // --- Keyboard control --------------------------------------------------
     char key = (char)cv::waitKey(30);
     if (key == 27) break;
-    if (key == 'o' || key == 'O') currentMode = MODE_ORIGINAL;
-    if (key == 't' || key == 'T') currentMode = MODE_THERMAL;
-    if (key == 'n' || key == 'N') currentMode = MODE_NIGHTVISION;
+    if (key == 'o' || key == 'O') {
+      currentMode = MODE_ORIGINAL;
+      std::cout << "[MODE] Normal + Gesture" << std::endl;
+    }
+    if (key == 't' || key == 'T') {
+      currentMode = MODE_THERMAL;
+      std::cout << "[MODE] Thermal" << std::endl;
+    }
+    if (key == 'n' || key == 'N') {
+      currentMode = MODE_NIGHTVISION;
+      std::cout << "[MODE] NVG + Targeting" << std::endl;
+    }
+    if (key == '1' && activeStream != 1) {
+      cap.release();
+      cap.open(STREAM_1, cv::CAP_FFMPEG);
+      if (cap.isOpened()) {
+        activeStream = 1;
+        std::cout << "[STREAM] Switched to stream 1: " << STREAM_1 << std::endl;
+      }
+      else {
+        std::cerr << "[ERROR] Cannot open stream 1: " << STREAM_1 << std::endl;
+      }
+    }
+    if (key == '2' && activeStream != 2) {
+      cap.release();
+      cap.open(STREAM_2, cv::CAP_FFMPEG);
+      if (cap.isOpened()) {
+        activeStream = 2;
+        std::cout << "[STREAM] Switched to stream 2: " << STREAM_2 << std::endl;
+      }
+      else {
+        std::cerr << "[ERROR] Cannot open stream 2: " << STREAM_2 << std::endl;
+      }
+    }
   }
 
+  g_running = false;
+  serverThread.join();
   cap.release();
   cv::destroyAllWindows();
   return 0;
